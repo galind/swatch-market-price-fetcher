@@ -32,7 +32,7 @@ def read_csv(file_path: str) -> list[list[str]]:
 
 
 def format_watch_reference(reference: str) -> str:
-    return reference.strip().replace(" ", "", 1)
+    return reference.strip().replace(" ", "", 1).replace(" ", "%20")
 
 
 def any_word_in_strings(words: list, strings: list) -> bool:

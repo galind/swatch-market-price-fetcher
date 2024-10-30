@@ -1,20 +1,22 @@
 import csv
+import json
 import logging
 from os import path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 def setup_console_logger(level: int = logging.INFO) -> logging.Logger:
     """Sets up and returns a logger with console output only."""
-    logger = logging.getLogger("watch_reference_logger")
+    logger = logging.getLogger(__name__)
     logger.setLevel(level)
 
-    # Avoid adding handlers if they already exist (for cases of repeated imports)
     if not logger.handlers:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
+
+        # Formatter with support for reference
         formatter = logging.Formatter(
-            "%(asctime)s | %(name)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            "%(asctime)s | %(name)s | %(levelname)s | %(reference)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
@@ -50,3 +52,10 @@ def format_watch_reference(reference: str) -> str:
 def any_word_in_strings(words: List[str], strings: List) -> bool:
     """Checks if any of the words appear in any of the given strings."""
     return any(word in string.text.lower() for string in strings for word in words)
+
+
+def save_to_json(data: List[Dict], file_path: str) -> None:
+    """Saves the processed data to a JSON file."""
+    with open(file_path, "w") as json_file:
+        json.dump(data, json_file, indent=4)
+    logging.info(f"Data saved to {file_path}")

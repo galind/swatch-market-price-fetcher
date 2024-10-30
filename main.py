@@ -1,41 +1,49 @@
 import logging
-from typing import Optional, List
+import time
+from typing import Optional, List, Dict, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 
-from utils import setup_console_logger, format_watch_reference, read_csv, any_word_in_strings
+from utils import setup_console_logger, format_watch_reference, read_csv, any_word_in_strings, save_to_json
 
 logger = setup_console_logger(logging.DEBUG)
 keyword_list = ["swatch", "watch", "reloj"]
 
 
-def get_ebay_results(session, watch_reference: str, check_sold: bool) -> Optional[List[float]]:
-    """Fetches eBay search results and returns list of prices."""
-    endpoint = f"https://www.ebay.es/sch/i.html?_nkw={watch_reference}&_in_kw=3&_sacat=281"
-    if check_sold:
+def get_ebay_results(session, watch_reference: str, check_active: bool) -> Tuple[Optional[List[float]], int]:
+    """Fetches eBay search results and returns a list of prices and the count of posts found."""
+    logger.debug(f"Fetching eBay results (active={check_active})", extra={"reference": watch_reference})
+    endpoint = f"https://www.ebay.es/sch/i.html?_nkw={format_watch_reference(watch_reference)}&_in_kw=3&_sacat=281"
+    if check_active:
         endpoint += "&LH_Sold=1&LH_Complete=1"
-    logger.debug(f"{watch_reference} | URL: {endpoint}")
+    logger.debug(f"URL: {endpoint}", extra={"reference": watch_reference})
 
     response = session.get(endpoint, allow_redirects=True)
     if response.status_code != 200:
-        logger.error(f"{watch_reference} | Request failed, status code: {response.status_code}")
-        return None
+        logger.error(f"Request failed with status code {response.status_code}", extra={"reference": watch_reference})
+        return None, 0
 
-    return parse_ebay_results(response.text, watch_reference)
+    prices, post_count = parse_ebay_results(response.text, watch_reference)
+    logger.info(
+        f"Found {post_count} {'active' if check_active else 'sold'} posts", extra={"reference": watch_reference}
+    )
+    return prices, post_count
 
 
-def parse_ebay_results(html: str, watch_reference: str) -> List[float]:
-    """Parses the HTML from eBay and extracts prices if available."""
+def parse_ebay_results(html: str, watch_reference: str) -> Tuple[List[float], int]:
+    """Parses the HTML from eBay, extracts prices if available, and returns prices with post count."""
     soup = BeautifulSoup(html, "html.parser")
     watch_posts = soup.find_all("div", {"class": "s-item__info clearfix"})
-    if not watch_posts:
-        logger.error(f"{watch_reference} | No posts found")
-        return []
+    post_count = len(watch_posts)
 
-    logger.debug(f"{watch_reference} | {len(watch_posts)} posts found")
+    if post_count == 0:
+        logger.warning("No posts found", extra={"reference": watch_reference})
+        return [], 0
+
+    logger.debug(f"Parsing {post_count} posts for prices", extra={"reference": watch_reference})
     price_list = [parse_price(post, watch_reference) for post in watch_posts]
-    return [price for price in price_list if price is not None]
+    return [price for price in price_list if price is not None], post_count
 
 
 def parse_price(post, watch_reference: str) -> Optional[float]:
@@ -43,82 +51,114 @@ def parse_price(post, watch_reference: str) -> Optional[float]:
     post_soup = BeautifulSoup(str(post), "html.parser")
     heading_list = post_soup.find_all("span", {"role": "heading"})
     if not any_word_in_strings(keyword_list, heading_list):
-        logger.debug(f"{watch_reference} | The item doesn't seem to be a watch")
+        logger.debug("Item skipped: does not match keywords", extra={"reference": watch_reference})
         return None
 
     price_span = post_soup.find("span", {"class": "ITALIC"})
     if price_span and price_span.text:
         try:
             clean_price = float(price_span.text.split()[0].replace(".", "").replace(",", "."))
-            return clean_price
+            logger.debug(f"Extracted price: {clean_price}", extra={"reference": watch_reference})
+            return round(clean_price, 2)
         except ValueError:
-            logger.warning(f"{watch_reference} | Price conversion failed")
+            logger.warning(f"Price conversion failed for text: {price_span.text}", extra={"reference": watch_reference})
     return None
 
 
-def calculate_average(prices: List[float]) -> Optional[float]:
-    """Calculates the average price from a list of prices."""
+def calculate_average(prices: List[float], reference: str) -> Optional[float]:
+    """Calculates the average price from a list of prices, rounded to 2 decimal places."""
     if prices:
-        return round(sum(prices) / len(prices), 2)
-    logger.debug("Empty price list encountered in average calculation")
+        average = round(sum(prices) / len(prices), 2)
+        logger.debug(f"Calculated average price: {average}", extra={"reference": reference})
+        return average
+    logger.debug("Empty price list encountered in average calculation", extra={"reference": reference})
     return None
 
 
 def load_data(file_path: str) -> List:
     """Loads and returns watch data from the CSV file."""
+    logger.info(f"Loading data from {file_path}", extra={"reference": "global"})
     data = read_csv(file_path)
     if data is None:
-        logger.error("Failed to load data. Exiting program.")
-        exit(1)  # Exit if data loading fails
+        logger.error("Failed to load data. Exiting program.", extra={"reference": "global"})
+        exit(1)
+    logger.info(f"Loaded {len(data)} items from {file_path}", extra={"reference": "global"})
     return data
 
 
-def process_watch(session, watch_data) -> Optional[float]:
-    """Processes each watch reference and calculates the average price."""
+def process_watch(session, watch_data) -> Dict:
+    """Processes each watch reference, calculates prices, and returns structured data."""
     year, reference, name, quantity = watch_data
-    formatted_reference = format_watch_reference(reference)
 
-    not_sold_results = get_ebay_results(session, formatted_reference, check_sold=False)
-    sold_results = get_ebay_results(session, formatted_reference, check_sold=True)
+    logger.info(f"Processing watch {reference}", extra={"reference": reference})
+    active_results, active_posts = get_ebay_results(session, reference, check_active=True)
+    sold_results, sold_posts = get_ebay_results(session, reference, check_active=False)
 
-    if not not_sold_results and not sold_results:
-        logger.error(f"{formatted_reference} | Watch not found, skipping...")
-        return None
+    avg_active = calculate_average(active_results, reference) if active_results else None
+    avg_sold = calculate_average(sold_results, reference) if sold_results else None
 
-    avg_not_sold = calculate_average(not_sold_results)
-    avg_sold = calculate_average(sold_results)
-
-    if avg_not_sold and avg_sold:
-        total_avg = round((avg_not_sold + avg_sold) / 2, 2)
+    if avg_active and avg_sold:
+        total_avg = round((avg_active + avg_sold) / 2, 2)
     else:
-        total_avg = avg_sold or avg_not_sold
+        total_avg = avg_sold or avg_active
 
-    if total_avg:
-        logger.info(f"{formatted_reference} | Average price: {total_avg} | Quantity: {quantity}")
-    return total_avg * int(quantity) if total_avg else None
+    watch_info = {
+        "year": year,
+        "reference": reference,
+        "name": name,
+        "quantity": quantity,
+        "avg_active": avg_active,
+        "avg_sold": avg_sold,
+        "total_avg": total_avg,
+        "total_value": round(total_avg * int(quantity), 2) if total_avg else None,
+        "active_posts_found": active_posts,
+        "sold_posts_found": sold_posts,
+    }
+
+    logger.info(
+        f"Summary: Active Avg: {avg_active}, Sold Avg: {avg_sold}, Total Avg: {total_avg}, Quantity: {quantity}",
+        extra={"reference": reference},
+    )
+
+    return watch_info
 
 
-def calculate_collection_value(session, data: List) -> float:
-    """Calculates the total value of the watch collection."""
-    total_value = 0
-    found_watches = 0
+def calculate_collection_value(session, data: List) -> List[Dict]:
+    """Calculates the total collection value and returns all processed watch data for JSON storage."""
+    results = []
+    start_time = time.time()
 
     for watch_data in data:
-        watch_value = process_watch(session, watch_data)
-        if watch_value:
-            total_value += watch_value
-            found_watches += 1
+        watch_info = process_watch(session, watch_data)
+        results.append(watch_info)
 
-    logger.info(f"Total collection value for {found_watches}/{len(data)} watches: {round(total_value, 2)}")
-    return total_value
+    elapsed_time = time.time() - start_time
+    logger.info(f"Processed {len(data)} watches in {elapsed_time:.2f} seconds", extra={"reference": "global"})
+    return results
 
 
-def run() -> None:
-    """Main function to execute the workflow."""
+def get_watch_data() -> None:
+    """
+    Fetches watch data from eBay, calculates prices, and saves the results to a JSON file.
+    """
     session = requests.Session()
     data = load_data("watches.csv")
-    calculate_collection_value(session, data)
+    processed_data = calculate_collection_value(session, data)
+    save_to_json(processed_data, "results.json")
+    logger.info("Data processing complete. Results saved to results.json")
 
 
 if __name__ == "__main__":
-    run()
+    print("1. Get collection data\n2. Display existent data\n")
+    try:
+        selected_option = int(input("What do you want to do? "))
+        match selected_option:
+            case 1:
+                get_watch_data()
+            case 2:
+                # Add any specific functionality if needed
+                pass
+            case _:
+                print("Invalid option")
+    except ValueError:
+        print("Please enter a valid number.")
